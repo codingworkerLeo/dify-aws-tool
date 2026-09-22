@@ -33,6 +33,10 @@ The SageMaker plugin supports cross-account access using AWS AssumeRole function
 
 SageMaker 插件支持使用 AWS AssumeRole 功能进行跨账户访问。这允许您访问部署在不同 AWS 账户中的 SageMaker 端点，同时保持安全最佳实践。
 
+**Supported model types**: AssumeRole cross-account access is available for **LLM**, **Text Embedding** and **Rerank** models. All three model types share the same `assume_role_arn` field in the provider's model credential schema, so the configuration steps below apply to each of them in exactly the same way. The plugin uses STS temporary credentials with automatic refresh (`RefreshableCredentials`), so no manual credential rotation is needed for long-running deployments.
+
+**支持的模型类型**：AssumeRole 跨账户访问适用于 **LLM**、**Text Embedding（文本嵌入）** 和 **Rerank（重排序）** 三种模型。这三种模型类型在模型提供商的凭证配置（model credential schema）中共用同一个 `assume_role_arn` 字段，因此下文的配置步骤对三者完全一致。插件使用 STS 临时凭证并自动续签（`RefreshableCredentials`），长期运行的部署无需手动轮换凭证。
+
 ### When to Use AssumeRole | 何时使用 AssumeRole
 
 - **Multi-account architecture**: When your SageMaker endpoints are in a different AWS account than your Dify deployment
@@ -123,6 +127,36 @@ When adding a SageMaker model in Dify, fill in the **Assume Role ARN** field:
 ```
 arn:aws:iam::TARGET-ACCOUNT-ID:role/SageMakerCrossAccountRole
 ```
+
+The **Assume Role ARN** field is defined once in the provider's `model_credential_schema` and is shown for **LLM**, **Text Embedding** and **Rerank** models alike. Pick the corresponding **Model Type** when adding the model, then fill in the same set of fields:
+
+**跨账户角色ARN** 字段在模型提供商的 `model_credential_schema` 中只定义一次，对 **LLM**、**Text Embedding** 和 **Rerank** 三种模型类型同样显示。添加模型时选择对应的 **模型类型**，然后填写同一组字段即可：
+
+**Text Embedding example | Text Embedding 示例**
+
+| Field / 字段 | Value / 取值 |
+|-------|-------|
+| Model Type / 模型类型 | `Text Embedding` |
+| Model Name / 模型名称 | `bge-m3-embedding` |
+| SageMaker Endpoint / SageMaker 端点 | `bge-m3-embedding-endpoint` |
+| AWS Region / AWS 地区 | `us-east-1` |
+| Access Key / Secret Access Key | Optional, source account credentials / 可选，源账户凭证 |
+| Assume Role ARN / 跨账户角色ARN | `arn:aws:iam::TARGET-ACCOUNT-ID:role/SageMakerCrossAccountRole` |
+
+**Rerank example | Rerank 示例**
+
+| Field / 字段 | Value / 取值 |
+|-------|-------|
+| Model Type / 模型类型 | `Rerank` |
+| Model Name / 模型名称 | `bge-reranker-v2-m3` |
+| SageMaker Endpoint / SageMaker 端点 | `bge-reranker-v2-m3-endpoint` |
+| AWS Region / AWS 地区 | `us-east-1` |
+| Access Key / Secret Access Key | Optional, source account credentials / 可选，源账户凭证 |
+| Assume Role ARN / 跨账户角色ARN | `arn:aws:iam::TARGET-ACCOUNT-ID:role/SageMakerCrossAccountRole` |
+
+For all three model types, the plugin first builds a session from the source account credentials (explicit Access Key / Secret Access Key, or the runtime environment's default credential chain), then calls `sts:AssumeRole` on the target role and invokes the endpoint with the temporary credentials. If **Assume Role ARN** is left empty, the plugin behaves exactly as before and invokes the endpoint directly with the source account credentials.
+
+对于这三种模型类型，插件都会先用源账户凭证（显式的 Access Key / Secret Access Key，或运行环境的默认凭证链）建立会话，再对目标角色调用 `sts:AssumeRole`，并使用临时凭证调用端点。如果 **跨账户角色ARN** 留空，插件行为与之前完全一致，直接使用源账户凭证调用端点。
 
 ### Configuration Options | 配置选项
 

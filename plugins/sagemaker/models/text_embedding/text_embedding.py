@@ -46,6 +46,11 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
     """
 
     sagemaker_client: Any = None
+    sagemaker_endpoint: str | None = None
+    access_key: str = None
+    secret_key: str = None
+    aws_region: str = None
+    assume_role_arn: str = None
 
     def _sagemaker_embedding(self, sm_client, endpoint_name, content_list: list[str]):
         response_model = sm_client.invoke_endpoint(
@@ -57,6 +62,28 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
         json_obj = json.loads(json_str)
         embeddings = json_obj["embeddings"]
         return embeddings
+
+    def _refresh_token(self):
+        " Refresh tokens by calling assume_role again "
+        params = {
+            "RoleArn": self.assume_role_arn,
+            "DurationSeconds": 3600,
+            "RoleSessionName": f"dify-sagemaker-embedding-{int(time.time())}"
+        }
+
+        boto_session = boto3.Session(region_name=self.aws_region)
+        sts_client = boto_session.client("sts")
+
+        response = sts_client.assume_role(**params).get("Credentials")
+
+        credentials = {
+            "access_key": response.get("AccessKeyId"),
+            "secret_key": response.get("SecretAccessKey"),
+            "token": response.get("SessionToken"),
+            "expiry_time": response.get("Expiration").isoformat(),
+        }
+
+        return credentials
 
     def _invoke(
         self,
@@ -79,22 +106,51 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
         # get model properties
         try:
             line = 1
-            if not self.sagemaker_client:
-                access_key = credentials.get("aws_access_key_id")
-                secret_key = credentials.get("aws_secret_access_key")
-                aws_region = credentials.get("aws_region")
-                if aws_region:
-                    if access_key and secret_key:
-                        self.sagemaker_client = boto3.client(
-                            "sagemaker-runtime",
-                            aws_access_key_id=access_key,
-                            aws_secret_access_key=secret_key,
-                            region_name=aws_region,
+            if self.access_key != credentials.get("aws_access_key_id") or \
+                self.secret_key != credentials.get("aws_secret_access_key") or \
+                self.aws_region != credentials.get("aws_region") or \
+                self.assume_role_arn != credentials.get("assume_role_arn") or \
+                self.sagemaker_endpoint != credentials.get("sagemaker_endpoint"):
+
+                # Any credential field changed (or first call): rebuild the client
+                self.access_key = credentials.get("aws_access_key_id")
+                self.secret_key = credentials.get("aws_secret_access_key")
+                self.aws_region = credentials.get("aws_region")
+                self.assume_role_arn = credentials.get("assume_role_arn")
+                self.sagemaker_endpoint = credentials.get("sagemaker_endpoint")
+
+                boto_session = None
+                if self.aws_region:
+                    if self.access_key and self.secret_key:
+                        boto_session = boto3.Session(
+                            aws_access_key_id=self.access_key,
+                            aws_secret_access_key=self.secret_key,
+                            region_name=self.aws_region,
                         )
                     else:
-                        self.sagemaker_client = boto3.client("sagemaker-runtime", region_name=aws_region)
+                        boto_session = boto3.Session(region_name=self.aws_region)
                 else:
-                    self.sagemaker_client = boto3.client("sagemaker-runtime")
+                    boto_session = boto3.Session()
+
+                # If assume role arn is specified, assume the role
+                if self.assume_role_arn:
+
+                    from botocore.credentials import RefreshableCredentials
+                    from botocore.session import get_session
+
+                    session_credentials = RefreshableCredentials.create_from_metadata(
+                        metadata=self._refresh_token(),
+                        refresh_using=self._refresh_token,
+                        method="sts-assume-role"
+                    )
+
+                    session = get_session()
+                    session._credentials = session_credentials
+                    session.set_config_variable("region", self.aws_region)
+
+                    boto_session = boto3.Session(botocore_session=session)
+
+                self.sagemaker_client = boto_session.client("sagemaker-runtime")
 
             line = 2
             sagemaker_endpoint = credentials.get("sagemaker_endpoint")
