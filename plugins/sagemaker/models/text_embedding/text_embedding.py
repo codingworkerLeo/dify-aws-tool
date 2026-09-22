@@ -50,11 +50,21 @@ _AUTH_ERROR_CODES = frozenset({
     "AuthFailure",
 })
 
-# botocore ClientError codes that mean the request was throttled.
+# botocore ClientError codes that mean the request was throttled. This is the set of standard
+# throttling codes botocore itself treats as retryable (botocore/data/_retry.json and
+# botocore.retries.standard), written out explicitly so no private botocore attribute is imported.
 _RATE_LIMIT_ERROR_CODES = frozenset({
+    "Throttling",
     "ThrottlingException",
+    "ThrottledException",
+    "RequestThrottledException",
+    "RequestThrottled",
     "TooManyRequestsException",
     "RequestLimitExceeded",
+    "ProvisionedThroughputExceededException",
+    "LimitExceededException",
+    "BandwidthLimitExceeded",
+    "SlowDown",
 })
 
 
@@ -78,8 +88,12 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
     aws_region: str = None
     assume_role_arn: str = None
 
-    # Guards compare -> build -> publish -> read of the six cached attributes above, so that two
-    # threads sharing one model instance can never pair one tenant's client with another's endpoint.
+    # Guards the compare-and-read and the publish of the six cached attributes above (two short
+    # critical sections, no I/O), so that two threads sharing one model instance can never pair one
+    # tenant's client with another's endpoint. This is a plain class attribute, i.e. one lock shared
+    # by every instance of this class; client construction (including the STS AssumeRole round-trip)
+    # deliberately happens OUTSIDE it, see _build_client(), so a slow or failing AssumeRole for one
+    # tenant never blocks another tenant's cache hit.
     _client_lock: Any = threading.Lock()
 
     def _sagemaker_embedding(self, sm_client, endpoint_name, content_list: list[str]):
@@ -140,6 +154,58 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
 
         return credentials
 
+    def _build_client(self, access_key, secret_key, region, role_arn):
+        """Build a sagemaker-runtime client from an immutable snapshot of one tenant's credentials.
+
+        Called by ``_invoke`` WITHOUT holding ``_client_lock``: this is where the STS AssumeRole
+        network round-trip happens, and it must never block other tenants' cache hits on the shared
+        instance. Nothing in here reads or writes the published ``self.*`` cache state; the caller
+        publishes the returned client together with exactly these keys under the lock.
+        """
+        boto_session = None
+        if region:
+            if access_key and secret_key:
+                boto_session = boto3.Session(
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    region_name=region,
+                )
+            else:
+                boto_session = boto3.Session(region_name=region)
+        else:
+            boto_session = boto3.Session()
+
+        # If assume role arn is specified, assume the role
+        if role_arn:
+
+            from botocore.credentials import RefreshableCredentials
+            from botocore.session import get_session
+
+            # Snapshot of the source-account identity for this build. The first AssumeRole and
+            # every automatic refresh use this same snapshot, never the published self.* state
+            # (which may belong to another tenant).
+            refresh_using = functools.partial(
+                self._refresh_token,
+                access_key=access_key,
+                secret_key=secret_key,
+                region=region,
+                role_arn=role_arn,
+            )
+
+            session_credentials = RefreshableCredentials.create_from_metadata(
+                metadata=refresh_using(),
+                refresh_using=refresh_using,
+                method="sts-assume-role"
+            )
+
+            session = get_session()
+            session._credentials = session_credentials
+            session.set_config_variable("region", region)
+
+            boto_session = boto3.Session(botocore_session=session)
+
+        return boto_session.client("sagemaker-runtime")
+
     def _invoke(
         self,
         model: str,
@@ -170,88 +236,43 @@ class SageMakerEmbeddingModel(TextEmbeddingModel):
             new_endpoint = credentials.get("sagemaker_endpoint")
 
             with self._client_lock:
-                if self.sagemaker_client is None or \
-                    self.access_key != new_access_key or \
-                    self.secret_key != new_secret_key or \
-                    self.aws_region != new_region or \
-                    self.assume_role_arn != new_assume_role_arn or \
-                    self.sagemaker_endpoint != new_endpoint:
+                # Short critical section 1 (no I/O): compare this call's keys against the published
+                # state and, on a hit, capture the matching client in the same step so a concurrent
+                # publish for another tenant cannot swap it underneath us.
+                if self.sagemaker_client is not None and \
+                    self.access_key == new_access_key and \
+                    self.secret_key == new_secret_key and \
+                    self.aws_region == new_region and \
+                    self.assume_role_arn == new_assume_role_arn and \
+                    self.sagemaker_endpoint == new_endpoint:
+                    sm_client = self.sagemaker_client
+                else:
+                    sm_client = None
 
-                    # Any credential field changed (or first call, or a previous build failed):
-                    # rebuild the client from the local values.
-                    #
-                    # Invariant: the five cache keys and self.sagemaker_client are always published
-                    # together, and only after the new client has been built. So "all five keys
-                    # equal" implies "self.sagemaker_client was built from exactly those keys".
-                    # If anything below raises, all six attributes are reset to None before
-                    # re-raising, so the next call is guaranteed to take this rebuild branch
-                    # (self.sagemaker_client is None) instead of reusing a client that was built
-                    # for a different tenant.
-                    try:
-                        boto_session = None
-                        if new_region:
-                            if new_access_key and new_secret_key:
-                                boto_session = boto3.Session(
-                                    aws_access_key_id=new_access_key,
-                                    aws_secret_access_key=new_secret_key,
-                                    region_name=new_region,
-                                )
-                            else:
-                                boto_session = boto3.Session(region_name=new_region)
-                        else:
-                            boto_session = boto3.Session()
+            if sm_client is None:
+                # Cache miss (first call, any credential field changed, or a previous build failed):
+                # build a new client OUTSIDE the lock from the immutable locals above. The STS
+                # AssumeRole round-trip inside _build_client therefore never blocks other threads'
+                # cache hits on this shared instance (dify runs one instance per model type and
+                # dispatches requests from a thread pool; the lock is shared class-wide).
+                #
+                # Invariant: the five cache keys and self.sagemaker_client are only ever written
+                # together, under the lock, after the client has been built from exactly those keys.
+                # So "all five keys equal" implies "self.sagemaker_client was built from those keys".
+                # A failed build raises here, before anything is published, so the previously
+                # published (still consistent) state is left untouched: the next call for the failing
+                # tenant compares unequal and rebuilds instead of reusing another tenant's client,
+                # while other tenants' cache hits are unaffected by the failure.
+                sm_client = self._build_client(new_access_key, new_secret_key, new_region, new_assume_role_arn)
 
-                        # If assume role arn is specified, assume the role
-                        if new_assume_role_arn:
-
-                            from botocore.credentials import RefreshableCredentials
-                            from botocore.session import get_session
-
-                            # Snapshot of the source-account identity for this build. The first
-                            # AssumeRole and every automatic refresh use this same snapshot, never
-                            # the published self.* state (which may belong to another tenant).
-                            refresh_using = functools.partial(
-                                self._refresh_token,
-                                access_key=new_access_key,
-                                secret_key=new_secret_key,
-                                region=new_region,
-                                role_arn=new_assume_role_arn,
-                            )
-
-                            session_credentials = RefreshableCredentials.create_from_metadata(
-                                metadata=refresh_using(),
-                                refresh_using=refresh_using,
-                                method="sts-assume-role"
-                            )
-
-                            session = get_session()
-                            session._credentials = session_credentials
-                            session.set_config_variable("region", new_region)
-
-                            boto_session = boto3.Session(botocore_session=session)
-
-                        new_client = boto_session.client("sagemaker-runtime")
-                    except Exception:
-                        # Build failed: invalidate the whole cache so the next call must rebuild.
-                        self.sagemaker_client = None
-                        self.access_key = None
-                        self.secret_key = None
-                        self.aws_region = None
-                        self.assume_role_arn = None
-                        self.sagemaker_endpoint = None
-                        raise
-
-                    # Atomic publish: keys and client become visible together.
+                with self._client_lock:
+                    # Short critical section 2 (no I/O): atomic publish, keys and client together.
                     self.access_key = new_access_key
                     self.secret_key = new_secret_key
                     self.aws_region = new_region
                     self.assume_role_arn = new_assume_role_arn
                     self.sagemaker_endpoint = new_endpoint
-                    self.sagemaker_client = new_client
-
-                # Capture the client matching this call's credentials while still holding the lock,
-                # so a concurrent rebuild for another tenant cannot swap it underneath us.
-                sm_client = self.sagemaker_client
+                    self.sagemaker_client = sm_client
 
             line = 2
             sagemaker_endpoint = credentials.get("sagemaker_endpoint")

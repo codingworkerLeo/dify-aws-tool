@@ -154,9 +154,9 @@ The **Assume Role ARN** field is defined once in the provider's `model_credentia
 | Access Key / Secret Access Key | Optional, source account credentials / 可选，源账户凭证 |
 | Assume Role ARN / 跨账户角色ARN | `arn:aws:iam::TARGET-ACCOUNT-ID:role/SageMakerCrossAccountRole` |
 
-For all three model types, the plugin first builds a session from the source account credentials (explicit Access Key / Secret Access Key, or the runtime environment's default credential chain), then calls `sts:AssumeRole` on the target role and invokes the endpoint with the temporary credentials. If **Assume Role ARN** is left empty, the plugin behaves exactly as before and invokes the endpoint directly with the source account credentials.
+For **Text Embedding** and **Rerank** models, the plugin first builds a session from the source account credentials (explicit Access Key / Secret Access Key, or the runtime environment's default credential chain), then calls `sts:AssumeRole` on the target role and invokes the endpoint with the temporary credentials. For **LLM** models, the session used to call `sts:AssumeRole` is currently built from the configured AWS Region and the runtime environment's default credential chain only; the explicit Access Key / Secret Access Key are not used for that AssumeRole call. If **Assume Role ARN** is left empty, the plugin behaves exactly as before and invokes the endpoint directly with the source account credentials.
 
-对于这三种模型类型，插件都会先用源账户凭证（显式的 Access Key / Secret Access Key，或运行环境的默认凭证链）建立会话，再对目标角色调用 `sts:AssumeRole`，并使用临时凭证调用端点。如果 **跨账户角色ARN** 留空，插件行为与之前完全一致，直接使用源账户凭证调用端点。
+对于 **Text Embedding** 和 **Rerank** 两种模型类型，插件会先用源账户凭证（显式的 Access Key / Secret Access Key，或运行环境的默认凭证链）建立会话，再对目标角色调用 `sts:AssumeRole`，并使用临时凭证调用端点。对于 **LLM** 模型类型，目前调用 `sts:AssumeRole` 的会话仅基于配置的 AWS 地区和运行环境的默认凭证链建立，显式填写的 Access Key / Secret Access Key 不会用于该 AssumeRole 调用。如果 **跨账户角色ARN** 留空，插件行为与之前完全一致，直接使用源账户凭证调用端点。
 
 ### Configuration Options | 配置选项
 
